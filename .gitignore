@@ -1,0 +1,42 @@
+# --- secrets -------------------------------------------------------------
+# The Ed25519 signing seed must never be committed. Anyone holding it can
+# mint licences.
+tools/dev_seed.txt
+tools/*_seed.txt
+*.seed
+
+# --- build artefacts -----------------------------------------------------
+build/
+dist/
+*.spec.bak
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+
+# --- environments --------------------------------------------------------
+.venv/
+venv/
+env/
+
+# --- IDE -----------------------------------------------------------------
+.idea/
+.vscode/
+*.iml
+
+# --- test artefacts ------------------------------------------------------
+tests/fixtures/
+.pytest_cache/
+
+# --- vendored binaries ---------------------------------------------------
+# Poppler was removed when PyMuPDF took over page rendering. Kept as an
+# ignore rule so a stray re-extraction never gets committed again.
+poppler-*/
+
+# --- generated output ----------------------------------------------------
+reportout/
+
+# --- local data ----------------------------------------------------------
+*.db
+*.db-wal
+*.db-shm

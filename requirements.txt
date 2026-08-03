@@ -1,0 +1,11 @@
+# Runtime
+PySide6>=6.7            # GUI toolkit
+PyMuPDF>=1.24           # PDF parsing and rendering (replaces Poppler)
+Pillow>=10.0            # report image compositing
+
+# Optional
+# cryptography>=42      # faster licence verification; pdfdiff falls back to
+#                       # its bundled pure-Python Ed25519 when absent
+
+# Build
+# pyinstaller>=6.0
