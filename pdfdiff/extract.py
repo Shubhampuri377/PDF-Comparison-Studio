@@ -313,6 +313,71 @@ def image_fingerprint(doc, doc_key: str, xref: int,
     return exact, phash, mean
 
 
+# Subset-embedded fonts carry a six-letter tag such as "ABCDEE+Calibri".
+# The tag is generated afresh every time a file is written, so two PDFs
+# showing the identical typeface report different font names -- and with
+# formatting comparison on, every single word then looks restyled.
+_SUBSET_TAG_RE = re.compile(r"^[A-Z]{6}\+")
+
+# Only the bits that describe visible style. Bit 0 (superscript) and the
+# serif/monospace hints are properties of the font, not of an edit.
+_STYLE_FLAG_MASK = (1 << 1) | (1 << 4)          # italic | bold
+
+# Font sizes wobble by hundredths between producers; half a point is the
+# smallest difference a reader could notice.
+_SIZE_QUANTUM = 0.5
+
+
+# Foundry suffixes that identify the vendor's build of a typeface rather than
+# the typeface itself: "Arial" and "ArialMT" are the same font, and which one
+# a PDF reports depends on the producer. Style words like "Roman" are
+# deliberately absent -- "Roman" is part of "TimesNewRoman", and stripping it
+# merges genuinely different families.
+_FOUNDRY_SUFFIX_RE = re.compile(r"(PSMT|MT|PS)$")
+
+
+def normalise_font_name(name: str) -> str:
+    """Strip the arbitrary parts of an embedded font name.
+
+    Two things get removed: the six-character subset tag, which the PDF
+    specification defines as arbitrary and which is regenerated on every save,
+    and the foundry suffix. Real files pair "Arial" against "ArialMT" for the
+    identical typeface, and treating those as a font change made every word on
+    every page report as restyled.
+    """
+    if not name:
+        return ""
+    name = _SUBSET_TAG_RE.sub("", name)
+    name = name.replace("-", "").replace(" ", "").replace("_", "")
+    name = _FOUNDRY_SUFFIX_RE.sub("", name)
+    return name.casefold()
+
+
+# Two colours closer than this in RGB are the same colour to a reader. Real
+# documents encode body text as #231A20 in one file and #030406 in the other;
+# both are black, and reporting that as a formatting change buried every page
+# under thousands of highlights.
+_COLOUR_TOLERANCE = 40
+
+
+def colours_differ(a: int, b: int) -> bool:
+    """Is the difference between two packed RGB values actually visible?"""
+    if a == b:
+        return False
+    ar, ag, ab = (a >> 16) & 255, (a >> 8) & 255, a & 255
+    br, bg, bb = (b >> 16) & 255, (b >> 8) & 255, b & 255
+    return (abs(ar - br) > _COLOUR_TOLERANCE
+            or abs(ag - bg) > _COLOUR_TOLERANCE
+            or abs(ab - bb) > _COLOUR_TOLERANCE)
+
+
+def quantise_size(size) -> float:
+    try:
+        return round(float(size) / _SIZE_QUANTUM) * _SIZE_QUANTUM
+    except (TypeError, ValueError):
+        return 0.0
+
+
 # --------------------------------------------------------------------------
 # Style index (only built when formatting comparison is on)
 # --------------------------------------------------------------------------
@@ -336,9 +401,10 @@ def _build_style_index(page):
                 bbox = span.get("bbox")
                 if not bbox:
                     continue
-                entry = (bbox, span.get("font", ""),
-                         round(float(span.get("size", 0.0)), 1),
-                         int(span.get("color", 0)), int(span.get("flags", 0)))
+                entry = (bbox, normalise_font_name(span.get("font", "")),
+                         quantise_size(span.get("size", 0.0)),
+                         int(span.get("color", 0)),
+                         int(span.get("flags", 0)) & _STYLE_FLAG_MASK)
                 lo = int(bbox[1] // 4)
                 hi = int(bbox[3] // 4)
                 for b in range(lo, hi + 1):
@@ -398,6 +464,15 @@ def ingest_chunk(task: dict) -> dict:
             width, height = float(rect.width), float(rect.height)
             rotation = int(page.rotation or 0)
 
+            # Word coordinates come back in unrotated page space, while
+            # page.rect and the rendered pixmap are both in rotated (displayed)
+            # space. On a 90 or 270 degree page those disagree completely --
+            # the page renders 842x595 while boxes are still measured against
+            # 595x842 -- so every highlight lands somewhere else entirely.
+            # Mapping the boxes through the rotation matrix here means every
+            # consumer downstream works in one consistent space.
+            rot_matrix = page.rotation_matrix if rotation else None
+
             raw_words = reading_order(page.get_text("words"))
 
             style_buckets = _build_style_index(page) if want_format else None
@@ -410,9 +485,14 @@ def ingest_chunk(task: dict) -> dict:
                 x0, y0, x1, y1, text = w[0], w[1], w[2], w[3], w[4]
                 if not text:
                     continue
+                if rot_matrix is not None:
+                    r = fitz.Rect(x0, y0, x1, y1) * rot_matrix
+                    x0, y0, x1, y1 = r.x0, r.y0, r.x1, r.y1
                 sid = -1
                 if style_buckets is not None:
-                    st = _lookup_style(style_buckets, x0, y0, x1, y1)
+                    # Span index is built from unrotated coordinates, so it
+                    # must be queried with the original box.
+                    st = _lookup_style(style_buckets, w[0], w[1], w[2], w[3])
                     if st is not None:
                         sid = style_ids.get(st, -1)
                         if sid == -1:
@@ -440,6 +520,8 @@ def ingest_chunk(task: dict) -> dict:
                     except Exception:
                         rects = []
                     for r in rects:
+                        if rot_matrix is not None:
+                            r = fitz.Rect(r) * rot_matrix
                         images.append((round(float(r.x0), 2), round(float(r.y0), 2),
                                        round(float(r.x1), 2), round(float(r.y1), 2),
                                        exact, phash, xref, mean))

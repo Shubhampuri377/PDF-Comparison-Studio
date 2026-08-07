@@ -209,6 +209,121 @@ def test_real_edit_still_detected():
           f"expected ~1 word, got removed={r} added={ad} changed={ch}")
 
 
+def test_font_subset_tags():
+    """Re-saving a PDF regenerates every embedded font's subset tag."""
+    print("\nembedded font subset tags")
+    from pdfdiff.extract import normalise_font_name as fold
+
+    check("same family, different subset tag",
+          fold("ABCDEE+Calibri") == fold("GHIJKL+Calibri"))
+    check("tagged matches untagged",
+          fold("AAAAAA+Helvetica") == fold("Helvetica"))
+    check("separator noise folded",
+          fold("Arial-BoldMT") == fold("ArialBoldMT"))
+    check("different families still differ",
+          fold("ABCDEF+Calibri") != fold("ABCDEF+Arial"))
+    check("weight is still a difference",
+          fold("Arial") != fold("Arial-Bold"))
+
+
+def test_rotated_page_highlights():
+    """Word boxes must land on the page as rendered, not as stored."""
+    print("\nrotated pages")
+    from pdfdiff.extract import ingest_chunk
+    from pdfdiff.store import unpack
+
+    for rot in (0, 90, 180, 270):
+        # A distinct file per rotation: ingest keeps parsed documents open in
+        # a per-process cache, so rewriting one path in a loop fails on
+        # Windows with a sharing violation.
+        path = os.path.join(FIXTURES, f"acc_rot_{rot}.pdf")
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((60, 100), "TOP LEFT MARKER", fontsize=14)
+        if rot:
+            page.set_rotation(rot)
+        doc.save(path)
+        doc.close()
+
+        res = ingest_chunk({"path": path, "side": 0, "start": 0, "end": 1,
+                            "compare_images": False, "image_fuzzy": False,
+                            "compare_formatting": False})
+        row = res["rows"][0]
+        width, height = row[2], row[3]
+        words = (unpack(row[9]) or {}).get("w") or []
+        inside = all(-1 <= w[0] <= width + 1 and -1 <= w[1] <= height + 1
+                     for w in words)
+        check(f"rotation {rot}: boxes fall inside the {width:.0f}x{height:.0f} page",
+              bool(words) and inside,
+              f"{len(words)} words, first={words[0][:4] if words else None}")
+
+
+
+def test_positional_drift():
+    """Sub-point drift must not masquerade as moved text.
+
+    Re-saving a document rounds glyph advance widths differently, so the
+    error accumulates along each line. This is the single biggest source of
+    false positives on real files -- it made move detection unusable.
+    """
+    print("\nsub-point positional drift")
+    import random
+
+    from pdfdiff.diffcore import diff_words
+    from pdfdiff.models import CH_MOVED
+
+    words = ("The parties hereby agree that the total consideration payable "
+             "under this clause shall not exceed the stated maximum").split()
+    rng = random.Random(4)
+    on = CompareSettings(detect_moves=True)
+
+    def build(drift, jitter, line_offset):
+        a, b = [], []
+        for line in range(25):
+            y = 80 + line * 20
+            off = rng.uniform(-line_offset, line_offset) if line_offset else 0.0
+            x = 60.0
+            for i, t in enumerate(words):
+                a.append((round(x, 3), y, round(x + 30, 3), y + 11, t, -1))
+                bx = x + off + drift * i
+                if jitter:
+                    bx += rng.uniform(-jitter, jitter)
+                b.append((round(bx, 3), y, round(bx + 30, 3), y + 11, t, -1))
+                x += 34
+        return a, b
+
+    def moved(a, b):
+        c, _bx, _s, _f = diff_words(a, [w[4] for w in a], b,
+                                    [w[4] for w in b], [], [], on)
+        return c.get(CH_MOVED, 0)
+
+    for label, d, j, o in (("uniform re-save drift", 0.30, 0.0, 0.0),
+                           ("heavier drift", 0.60, 0.0, 0.0),
+                           ("drift plus per-line offset", 0.30, 0.0, 2.5),
+                           ("drift, offset and jitter", 0.30, 0.4, 2.5)):
+        a, b = build(d, j, o)
+        n = moved(a, b)
+        check(f"no false moves: {label}", n == 0, f"{n} reported")
+
+    # A real relocation must survive, and must not drag its line-mates in.
+    a, b = build(0.30, 0.0, 2.5)
+    w = b[60]
+    b[60] = (w[0] + 40, w[1] + 24, w[2] + 40, w[3] + 24, w[4], -1)
+    n = moved(a, b)
+    check("one relocated word reported exactly once", n == 2,
+          f"{n} highlights (2 == one word, both sides)")
+
+    a, b = build(0.30, 0.0, 2.5)
+    for idx in (60, 61, 140):
+        w = b[idx]
+        b[idx] = (w[0] + 40, w[1] + 24, w[2] + 40, w[3] + 24, w[4], -1)
+    n = moved(a, b)
+    check("three relocated words reported exactly", n == 6, f"{n} highlights")
+
+    check("moves are off by default",
+          CompareSettings().detect_moves is False)
+
+
 def main() -> int:
     import shutil
 
@@ -220,6 +335,9 @@ def main() -> int:
     test_identical_text()
     test_normaliser_folds_lookalikes()
     test_block_order()
+    test_font_subset_tags()
+    test_rotated_page_highlights()
+    test_positional_drift()
     test_same_image_recompressed()
     test_genuinely_different_image()
     test_real_edit_still_detected()

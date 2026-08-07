@@ -11,6 +11,7 @@ import unicodedata
 from difflib import SequenceMatcher
 from statistics import median
 
+from .extract import colours_differ
 from .ignore import IgnoreSet
 from .models import (
     CH_ADDED, CH_CHANGED, CH_FORMAT, CH_IMG_ADDED, CH_IMG_CHANGED,
@@ -143,6 +144,105 @@ def _median_shift(pairs: list[tuple[tuple, tuple]]) -> tuple[float, float]:
     return median(dxs), median(dys)
 
 
+# A line's own shift is only trusted once this many words agree on it.
+_MIN_PAIRS_PER_LINE = 3
+_LINE_BUCKET_PT = 4.0
+# Residual beyond which a word is treated as an outlier when refitting.
+_FIT_OUTLIER_PT = 2.0
+
+
+def _line_shifts(pairs: list[tuple[tuple, tuple]], page_mdx: float,
+                 page_mdy: float) -> dict[int, tuple[float, float, float]]:
+    """Expected shift per line, as ``(intercept, slope, dy)``.
+
+    One median for the whole page is not enough, and neither is one median
+    per line. Re-saving a document rounds glyph advance widths slightly
+    differently, so the error *accumulates along the line*: a fraction of a
+    point at the left margin, several points by the right. That is a
+    proportional error, and no constant offset can absorb it -- subtract the
+    line's average and the two ends still stick out by half the total drift,
+    which is exactly why real documents light up with "moved" markers that
+    correspond to nothing a reader would notice.
+
+    So each line gets a least-squares fit of horizontal shift against
+    horizontal position, ``dx ≈ intercept + slope * x``. Uniform translation
+    is the intercept, cumulative glyph drift is the slope, and what remains is
+    a word that genuinely moved relative to its neighbours. Vertical shift
+    stays a plain median: it does not accumulate along a line.
+
+    Lines with too few matched words fall back to the page-wide shift rather
+    than fitting a line through two points.
+    """
+    buckets: dict[int, list[tuple[tuple, tuple]]] = {}
+    for a, b in pairs:
+        buckets.setdefault(int(a[1] // _LINE_BUCKET_PT), []).append((a, b))
+
+    out: dict[int, tuple[float, float, float]] = {}
+    for key, items in buckets.items():
+        if len(items) < _MIN_PAIRS_PER_LINE:
+            out[key] = (page_mdx, 0.0, page_mdy)
+            continue
+
+        xs = [a[0] for a, _b in items]
+        dxs = [b[0] - a[0] for a, b in items]
+        dys = [b[1] - a[1] for a, b in items]
+
+        fit = _fit_line(xs, dxs)
+        if fit is None:
+            out[key] = (median(dxs), 0.0, median(dys))
+            continue
+        intercept, slope = fit
+        out[key] = (intercept, slope, median(dys))
+    return out
+
+
+# Above this many words on one line, pairwise slopes are sampled rather than
+# enumerated: the estimator is O(n^2) and a line never needs that precision.
+_MAX_SLOPE_PAIRS = 600
+
+
+def _fit_line(xs: list[float], ys: list[float]):
+    """Robust ``y = intercept + slope * x`` via a Theil-Sen estimator.
+
+    Least squares was the obvious choice and the wrong one. A genuinely
+    relocated word is a large outlier, and least squares is pulled hard by
+    outliers: the fitted line tilts toward the moved word, so its innocent
+    neighbours acquire big residuals and get reported as moved as well. One
+    real move became fourteen highlights. Trimming and refitting did not
+    rescue it either, because the trim uses residuals from the already-skewed
+    first pass and discards the wrong points.
+
+    Theil-Sen takes the median of the slopes between every pair of points,
+    which tolerates roughly 29% of the data being outliers before it shifts at
+    all. That is exactly the right property here: the drift is what most words
+    agree on, and a moved word is meant to disagree.
+    """
+    n = len(xs)
+    if n < 2:
+        return None
+    if max(xs) - min(xs) < 1e-6:
+        return None
+
+    slopes: list[float] = []
+    if n * (n - 1) // 2 <= _MAX_SLOPE_PAIRS:
+        pairs = ((i, j) for i in range(n) for j in range(i + 1, n))
+    else:
+        step = max(1, (n * (n - 1) // 2) // _MAX_SLOPE_PAIRS)
+        pairs = ((i, j) for k, (i, j) in enumerate(
+            ((i, j) for i in range(n) for j in range(i + 1, n)))
+            if k % step == 0)
+    for i, j in pairs:
+        dx = xs[j] - xs[i]
+        if abs(dx) > 1e-6:
+            slopes.append((ys[j] - ys[i]) / dx)
+    if not slopes:
+        return None
+
+    slope = median(slopes)
+    intercept = median([y - slope * x for x, y in zip(xs, ys)])
+    return intercept, slope
+
+
 def diff_words(words_a: list[tuple], tokens_a: list[str],
                words_b: list[tuple], tokens_b: list[str],
                styles_a: list[tuple], styles_b: list[tuple],
@@ -169,6 +269,8 @@ def diff_words(words_a: list[tuple], tokens_a: list[str],
 
     mdx, mdy = _median_shift(equal_pairs)
     tol = settings.move_tolerance_pt
+    check_moves = settings.detect_moves and tol >= 0
+    line_shift = _line_shifts(equal_pairs, mdx, mdy) if check_moves else {}
     check_format = settings.compare_formatting and (styles_a or styles_b)
 
     # A non-zero dominant shift means the whole block of content slid -- a
@@ -185,15 +287,20 @@ def diff_words(words_a: list[tuple], tokens_a: list[str],
             for k in range(i2 - i1):
                 wa = words_a[i1 + k]
                 wb = words_b[j1 + k]
-                if tol >= 0:
-                    dx = (wb[0] - wa[0]) - mdx
-                    dy = (wb[1] - wa[1]) - mdy
+                if check_moves:
+                    # Residual against this line's fitted drift, so uniform
+                    # translation and cumulative glyph-width error both fall
+                    # out and only a real relocation is left.
+                    icept, slope, lmy = line_shift.get(
+                        int(wa[1] // _LINE_BUCKET_PT), (mdx, 0.0, mdy))
+                    dx = (wb[0] - wa[0]) - (icept + slope * wa[0])
+                    dy = (wb[1] - wa[1]) - lmy
                     if abs(dx) > tol or abs(dy) > tol:
                         moved_candidates.append((wa, wb))
                 if check_format:
                     sa = styles_a[wa[5]] if 0 <= wa[5] < len(styles_a) else None
                     sb = styles_b[wb[5]] if 0 <= wb[5] < len(styles_b) else None
-                    if sa is not None and sb is not None and sa != sb:
+                    if sa is not None and sb is not None                             and _styles_differ(sa, sb):
                         format_changes.append((wa, wb, _describe_style(sa, sb)))
         elif tag == "delete":
             for w in words_a[i1:i2]:
@@ -236,6 +343,24 @@ def diff_words(words_a: list[tuple], tokens_a: list[str],
                       + counts.get(CH_CHANGED, 0) / 2)
     similarity = max(0.0, 1.0 - changed_tokens / denom)
     return counts, highlights, similarity, flags
+
+
+def _styles_differ(sa: tuple, sb: tuple) -> bool:
+    """Compare two styles the way a reader would.
+
+    Tuple equality was too strict for real files. Producers disagree on the
+    exact encoding of black, on font size by hundredths of a point, and on
+    whether a typeface is called "Arial" or "ArialMT" -- none of which a
+    reviewer would call a formatting change, yet together they flagged every
+    word on every page.
+    """
+    if sa[0] != sb[0]:                       # font family, already normalised
+        return True
+    if abs(float(sa[1]) - float(sb[1])) > 0.01:
+        return True
+    if colours_differ(int(sa[2]), int(sb[2])):
+        return True
+    return int(sa[3]) != int(sb[3])          # bold / italic, already masked
 
 
 _STYLE_FLAG_NAMES = [(1 << 0, "superscript"), (1 << 1, "italic"),

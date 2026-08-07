@@ -280,10 +280,20 @@ class ComparisonEngine:
         self._check_cancel()
 
         self._emit(PHASE_ALIGN, 1, 3, "Matching pages")
+        def tokens_for(side: int, pno: int) -> set:
+            """Distinct words on a page, for the reorder-rescue pass.
+
+            Only ever called for the handful of pages the monotonic
+            alignment could not place, so loading their payloads is cheap.
+            """
+            payload = store.page_payload(side, pno) or {}
+            return {w[4] for w in (payload.get("w") or []) if w[4]}
+
         pairs = align_documents(
             exact_a, exact_b, sims_a, sims_b, counts_a, counts_b,
             min_similarity=self.settings.align_min_similarity,
-            enabled=self.settings.align_pages)
+            enabled=self.settings.align_pages,
+            tokens_for=tokens_for)
         self._check_cancel()
 
         self.align_stats = alignment_stats(pairs)

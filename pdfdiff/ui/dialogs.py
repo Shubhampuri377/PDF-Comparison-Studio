@@ -14,10 +14,12 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QWidget)
 
 from ..ignore import PATTERN_PRESETS
-from ..models import CompareSettings, RuntimeSettings
+from ..models import (ALL_CATEGORIES, CATEGORY_LABELS, CH_FORMAT,
+                      CompareSettings, IMAGE_CATEGORIES, RuntimeSettings,
+                      TEXT_CATEGORIES)
 from ..reporting import (ALL_FORMATS, FMT_CSV, FMT_HTML, FMT_JSON, FMT_PDF,
                          ReportOptions)
-from .theme import Palette
+from .theme import CATEGORY_HEX, Palette, swatch
 from .widgets import Card, hline, label, section
 
 
@@ -205,6 +207,14 @@ class SettingsDialog(QDialog):
             form.addRow(cb)
 
         form.addRow(hline(self.p))
+        self.cb_moves = QCheckBox("Detect moved text")
+        self.cb_moves.setChecked(self._settings.detect_moves)
+        self.cb_moves.setToolTip(
+            "Off by default. Re-saving a document nudges words by fractions "
+            "of a point; this reports only text that moved relative to its "
+            "neighbours.")
+        form.addRow(self.cb_moves)
+
         self.sp_move = QDoubleSpinBox()
         self.sp_move.setRange(0.0, 72.0)
         self.sp_move.setSingleStep(0.5)
@@ -212,9 +222,12 @@ class SettingsDialog(QDialog):
         self.sp_move.setValue(self._settings.move_tolerance_pt)
         form.addRow("Movement tolerance", self.sp_move)
         form.addRow("", label(
-            "Text that shifts by less than this is treated as unchanged. "
-            "A uniform shift of the whole page is always ignored.",
+            "Each line's own drift is measured and subtracted first, so a "
+            "re-save that nudges words along the line is not reported. Only "
+            "text that moved relative to its neighbours counts.",
             "Faint", wrap=True))
+        self.cb_moves.toggled.connect(self.sp_move.setEnabled)
+        self.sp_move.setEnabled(self.cb_moves.isChecked())
         return w
 
     def _layout_tab(self) -> QWidget:
@@ -355,6 +368,7 @@ class SettingsDialog(QDialog):
         self.cb_punct.setChecked(defaults.ignore_punctuation)
         self.cb_digits.setChecked(defaults.ignore_digits)
         self.cb_format.setChecked(defaults.compare_formatting)
+        self.cb_moves.setChecked(defaults.detect_moves)
         self.sp_move.setValue(defaults.move_tolerance_pt)
         self.sp_header.setValue(defaults.header_ignore_pt)
         self.sp_footer.setValue(defaults.footer_ignore_pt)
@@ -374,6 +388,7 @@ class SettingsDialog(QDialog):
         s.ignore_punctuation = self.cb_punct.isChecked()
         s.ignore_digits = self.cb_digits.isChecked()
         s.compare_formatting = self.cb_format.isChecked()
+        s.detect_moves = self.cb_moves.isChecked()
         s.move_tolerance_pt = self.sp_move.value()
         s.header_ignore_pt = self.sp_header.value()
         s.footer_ignore_pt = self.sp_footer.value()
@@ -402,14 +417,33 @@ class ReportDialog(QDialog):
     """Choose formats and scope, then write the report."""
 
     def __init__(self, palette: Palette, default_dir: str, default_name: str,
-                 changed_pages: int, parent=None):
+                 changed_pages: int, ignore_rules: list | None = None,
+                 parent=None):
         super().__init__(parent)
         self.p = palette
+        self._ignore_rules = ignore_rules or []
         self.setWindowTitle("Export report")
-        self.setMinimumWidth(600)
+        self.setMinimumWidth(620)
         self._changed = changed_pages
 
-        lay = QVBoxLayout(self)
+        # The options grew past the height of a laptop screen, which pushed
+        # Export off the bottom with no way to scroll to it. The options now
+        # live in a scroll area and the buttons sit outside it, so Export is
+        # always reachable however tall the content gets.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+
+        lay = QVBoxLayout(body)
         lay.setContentsMargins(24, 22, 24, 20)
         lay.setSpacing(13)
         lay.addWidget(label("Export report", "H2"))
@@ -450,14 +484,58 @@ class ReportDialog(QDialog):
         fmt_row.addStretch(1)
         lay.addLayout(fmt_row)
 
+        lay.addWidget(section("Include which changes"))
+        lay.addWidget(label(
+            "Pages whose only differences are unticked types are left out of "
+            "the report entirely.", "Faint", wrap=True))
+
+        cat_grid = QGridLayout()
+        cat_grid.setHorizontalSpacing(22)
+        cat_grid.setVerticalSpacing(4)
+        self.cat_boxes: dict[str, QCheckBox] = {}
+        for i, cat in enumerate(ALL_CATEGORIES):
+            cb = QCheckBox(CATEGORY_LABELS.get(cat, cat))
+            cb.setChecked(True)
+            cb.setIcon(swatch(CATEGORY_HEX.get(cat, "#8b98a9")))
+            self.cat_boxes[cat] = cb
+            cat_grid.addWidget(cb, i % 5, i // 5)
+        lay.addLayout(cat_grid)
+
+        quick = QHBoxLayout()
+        quick.setSpacing(6)
+        for text, keep in (("All", set(ALL_CATEGORIES)),
+                           ("Text only", set(TEXT_CATEGORIES)),
+                           ("Images only", set(IMAGE_CATEGORIES)),
+                           ("Exclude formatting",
+                            set(ALL_CATEGORIES) - {CH_FORMAT})):
+            btn = QPushButton(text)
+            btn.setProperty("flat", True)
+            btn.clicked.connect(lambda _c=False, k=keep: self._set_cats(k))
+            quick.addWidget(btn)
+        quick.addStretch(1)
+        lay.addLayout(quick)
+
         lay.addWidget(section("Contents"))
         self.cb_identical = QCheckBox("Include pages with no differences")
         self.cb_thumbs = QCheckBox("Include page images")
         self.cb_thumbs.setChecked(True)
         self.cb_text = QCheckBox("List the changed words")
         self.cb_text.setChecked(True)
-        for cb in (self.cb_thumbs, self.cb_text, self.cb_identical):
+        self.cb_mask = QCheckBox("Blank out excluded areas in the page images")
+        self.cb_mask.setChecked(True)
+        self.cb_mask.setToolTip(
+            "Areas you excluded were never compared. Blanking them keeps the "
+            "report an account of what was actually checked.")
+        for cb in (self.cb_thumbs, self.cb_text, self.cb_mask,
+                   self.cb_identical):
             lay.addWidget(cb)
+
+        page_row = QHBoxLayout()
+        page_row.addWidget(label("Only these pages"))
+        self.pages_edit = QLineEdit()
+        self.pages_edit.setPlaceholderText("all pages — or e.g. 1-20, 45, 200-")
+        page_row.addWidget(self.pages_edit, 1)
+        lay.addLayout(page_row)
 
         limit_row = QHBoxLayout()
         limit_row.addWidget(label("Maximum pages to render"))
@@ -477,14 +555,34 @@ class ReportDialog(QDialog):
         self.progress.setVisible(False)
         lay.addWidget(self.progress)
 
+
+        # Action bar lives outside the scroll area so it is always on screen.
+        bar = QWidget()
+        bar.setObjectName("TopBar")
+        bar_lay = QHBoxLayout(bar)
+        bar_lay.setContentsMargins(24, 12, 24, 12)
+        bar_lay.addStretch(1)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         self.export_btn = QPushButton("Export")
         self.export_btn.setProperty("accent", True)
         self.export_btn.setDefault(True)
+        self.export_btn.setMinimumWidth(110)
         buttons.addButton(self.export_btn,
                           QDialogButtonBox.ButtonRole.AcceptRole)
         buttons.rejected.connect(self.reject)
-        lay.addWidget(buttons)
+        bar_lay.addWidget(buttons)
+        outer.addWidget(bar)
+
+        self._fit_to_screen()
+
+    def _fit_to_screen(self):
+        """Open at content height, but never taller than the screen."""
+        from PySide6.QtGui import QGuiApplication
+
+        screen = QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry().height() if screen else 900
+        wanted = self.sizeHint().height()
+        self.resize(self.sizeHint().width(), min(wanted, int(avail * 0.85)))
 
     def _update_hint(self):
         limit = self.sp_limit.value()
@@ -505,6 +603,10 @@ class ReportDialog(QDialog):
         if path:
             self.dir_edit.setText(path)
 
+    def _set_cats(self, keep: set):
+        for cat, cb in self.cat_boxes.items():
+            cb.setChecked(cat in keep)
+
     def options(self) -> ReportOptions:
         return ReportOptions(
             title=self.title_edit.text().strip() or "PDF Comparison Report",
@@ -513,7 +615,12 @@ class ReportDialog(QDialog):
             include_identical=self.cb_identical.isChecked(),
             include_thumbnails=self.cb_thumbs.isChecked(),
             include_change_text=self.cb_text.isChecked(),
-            max_thumbnails=self.sp_limit.value())
+            max_thumbnails=self.sp_limit.value(),
+            categories=[c for c, cb in self.cat_boxes.items()
+                        if cb.isChecked()],
+            page_range=self.pages_edit.text().strip(),
+            ignore_rules=list(self._ignore_rules),
+            mask_ignored=self.cb_mask.isChecked())
 
     def output_dir(self) -> str:
         return self.dir_edit.text().strip()

@@ -13,7 +13,7 @@ from typing import Any, Iterable
 # Bump whenever the stored page payload or the page-fingerprint algorithm
 # changes; cached sessions from an older build are then rejected and re-parsed
 # rather than silently answering with stale fingerprints.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 9
 
 # Side identifiers.  Kept as small ints because they are written to SQLite on
 # every page row.
@@ -101,7 +101,11 @@ class CompareSettings:
     ignore_patterns: list[str] = field(default_factory=list)
 
     # -- geometry ----------------------------------------------------------
-    move_tolerance_pt: float = 2.0
+    # Off by default. Reviewers overwhelmingly want to know what the text
+    # *says*, not that a re-save nudged it; leaving this on made the first
+    # thing every user did be to switch it off again.
+    detect_moves: bool = False
+    move_tolerance_pt: float = 3.0
     header_ignore_pt: float = 0.0
     footer_ignore_pt: float = 0.0
 

@@ -17,8 +17,9 @@ from datetime import datetime
 
 from .changes import group_changes
 from .models import (
-    ALL_CATEGORIES, CATEGORY_LABELS, DocumentInfo, FLAG_LABELS, KIND_ADDED,
-    KIND_REMOVED, PageStat, Summary,
+    ALL_CATEGORIES, CATEGORY_LABELS, CH_ADDED, CH_IMG_ADDED, CH_IMG_REMOVED,
+    CH_REMOVED, DocumentInfo, FLAG_LABELS, IMAGE_CATEGORIES, KIND_ADDED,
+    KIND_REMOVED, PageStat, Summary, TEXT_CATEGORIES,
 )
 from .render import HIGHLIGHT_COLOURS, PageRenderer, render_pair_image
 from .store import FILTER_ALL, FILTER_CHANGED, ResultStore
@@ -43,6 +44,63 @@ class ReportOptions:
     include_change_text: bool = True
     max_changes_listed: int = 40
 
+    # Which change types the report is about. A page whose only differences
+    # fall outside this set is left out entirely, so excluding "Formatting"
+    # produces a report about content changes rather than one padded with
+    # every restyled word.
+    categories: list[str] = field(default_factory=lambda: list(ALL_CATEGORIES))
+    # Optional page filter, same syntax as the ignore rules: "1-20, 45, 200-".
+    page_range: str = ""
+
+    # Exclusion rectangles applied during the comparison. Blanking them in
+    # the report keeps it an account of what was actually checked: content
+    # that was never compared should not sit in the evidence looking as
+    # though it was and matched.
+    ignore_rules: list[dict] = field(default_factory=list)
+    mask_ignored: bool = True
+
+    def masks_for(self, a_pno, b_pno):
+        """Fractional rectangles to blank on each side of a page pair."""
+        if not (self.mask_ignored and self.ignore_rules):
+            return None, None
+        from .ignore import IgnoreSet
+
+        iset = IgnoreSet(self.ignore_rules)
+        left = iset.rects_for(0, a_pno) if a_pno is not None else []
+        right = iset.rects_for(1, b_pno) if b_pno is not None else []
+        return (left or None), (right or None)
+
+    def selected(self) -> set[str]:
+        return set(self.categories) if self.categories else set(ALL_CATEGORIES)
+
+    def excluded(self) -> list[str]:
+        return [c for c in ALL_CATEGORIES if c not in self.selected()]
+
+    def counts_for(self, stat) -> dict:
+        """A page's counts restricted to the selected categories."""
+        chosen = self.selected()
+        return {k: v for k, v in stat.counts.items() if k in chosen and v}
+
+    def includes(self, stat) -> bool:
+        """Does this page belong in the report at all?"""
+        if self.page_range:
+            from .ignore import parse_page_spec, spec_matches
+
+            ranges = parse_page_spec(self.page_range)
+            pno = stat.a_pno if stat.a_pno is not None else stat.b_pno
+            if pno is None or not spec_matches(ranges, pno):
+                return False
+        if self.include_identical:
+            return True
+        # Structural pages carry no per-category counts of their own, so they
+        # are governed by whether the corresponding category is selected.
+        if stat.kind == KIND_ADDED:
+            return CH_ADDED in self.selected() or CH_IMG_ADDED in self.selected()
+        if stat.kind == KIND_REMOVED:
+            return (CH_REMOVED in self.selected()
+                    or CH_IMG_REMOVED in self.selected())
+        return bool(self.counts_for(stat))
+
 
 def _fmt_int(n) -> str:
     return f"{n:,}"
@@ -61,8 +119,50 @@ def _human_size(n: int) -> str:
 
 
 def _iter_report_rows(store: ResultStore, options: ReportOptions):
+    """Pages that belong in this report, honouring category and page filters."""
     flt = FILTER_ALL if options.include_identical else FILTER_CHANGED
-    yield from store.iter_stats(flt)
+    for stat in store.iter_stats(flt):
+        if options.includes(stat):
+            yield stat
+
+
+def _filtered_boxes(boxes, options: ReportOptions):
+    chosen = options.selected()
+    return [b for b in boxes if b[0] in chosen]
+
+
+def _report_summary(store: ResultStore, options: ReportOptions,
+                    base: Summary) -> Summary:
+    """Recount the summary over exactly what the report will show.
+
+    Without this the headline says "23 pages differ" while the body lists
+    four, because the numbers came from the whole comparison and the pages
+    came from the filter.
+    """
+    if (options.selected() == set(ALL_CATEGORIES) and not options.page_range
+            and not options.include_identical):
+        return base
+
+    out = Summary(pages_a=base.pages_a, pages_b=base.pages_b,
+                  duration_s=base.duration_s)
+    totals: dict[str, int] = {}
+    for stat in _iter_report_rows(store, options):
+        out.total_pairs += 1
+        counts = options.counts_for(stat)
+        if stat.kind == KIND_ADDED:
+            out.added_pages += 1
+        elif stat.kind == KIND_REMOVED:
+            out.removed_pages += 1
+        if stat.status == "error":
+            out.errors += 1
+        elif counts or stat.kind != "matched":
+            out.changed += 1
+        else:
+            out.identical += 1
+        for k, v in counts.items():
+            totals[k] = totals.get(k, 0) + v
+    out.counts = totals
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -245,6 +345,7 @@ def generate_html(path: str, store: ResultStore, info_a: DocumentInfo,
                   progress_cb=None) -> str:
     stats = list(_iter_report_rows(store, options))
     total_rows = len(stats)
+    summary = _report_summary(store, options, summary)
 
     e = html.escape
     parts: list[str] = []
@@ -303,6 +404,14 @@ def generate_html(path: str, store: ResultStore, info_a: DocumentInfo,
         add("</dl></div>")
     add("</div>")
 
+    # -- excluded areas ----------------------------------------------------
+    if options.mask_ignored and options.ignore_rules:
+        add('<div class="legend"><span class="chip">'
+            '<i style="background:#b0b8c4"></i>'
+            f'{len(options.ignore_rules)} excluded area(s) were not compared, '
+            'and are blanked out in the page images below'
+            '</span></div>')
+
     # -- legend / category totals -----------------------------------------
     if summary.counts:
         add('<div class="legend">')
@@ -339,18 +448,22 @@ def generate_html(path: str, store: ResultStore, info_a: DocumentInfo,
             add(f'<th data-sort="{key}">{label}</th>')
         add('</tr></thead><tbody id="rows">')
         for st in stats:
+            shown = options.counts_for(st)
+            st_text = sum(v for k, v in shown.items() if k in TEXT_CATEGORIES)
+            st_image = sum(v for k, v in shown.items() if k in IMAGE_CATEGORIES)
+            st_total = st_text + st_image
             search = f"{st.label()} {st.status} {' '.join(st.flag_labels())}".lower()
             add(f'<tr data-kind="{e(st.kind)}" data-page="{st.idx}" '
                 f'data-status="{e(st.status)}" data-text="{st.text_changes}" '
-                f'data-image="{st.image_changes}" data-total="{st.total_changes}" '
+                f'data-image="{st_image}" data-total="{st_total}" '
                 f'data-sim="{st.similarity:.4f}" '
                 f'data-flags="{e(" ".join(st.flag_labels()))}" '
                 f'data-search="{e(search)}">')
             add(f"<td><strong>{e(st.label())}</strong></td>")
             add(f"<td>{_status_pill(st)}</td>")
-            add(f'<td class="num">{_fmt_int(st.text_changes) if st.text_changes else "—"}</td>')
-            add(f'<td class="num">{_fmt_int(st.image_changes) if st.image_changes else "—"}</td>')
-            add(f'<td class="num">{_fmt_int(st.total_changes) if st.total_changes else "—"}</td>')
+            add(f'<td class="num">{_fmt_int(st_text) if st_text else "—"}</td>')
+            add(f'<td class="num">{_fmt_int(st_image) if st_image else "—"}</td>')
+            add(f'<td class="num">{_fmt_int(st_total) if st_total else "—"}</td>')
             add(f'<td><div class="bar"><span style="width:'
                 f'{st.similarity * 100:.0f}%"></span></div></td>')
             add(f'<td class="flags">{e(", ".join(st.flag_labels())) or "—"}</td>')
@@ -373,11 +486,13 @@ def generate_html(path: str, store: ResultStore, info_a: DocumentInfo,
                 break
             if st.status == "identical":
                 continue
-            boxes = store.get_boxes(st.idx)
+            boxes = _filtered_boxes(store.get_boxes(st.idx), options)
+            mask_a, mask_b = options.masks_for(st.a_pno, st.b_pno)
             try:
                 image = render_pair_image(renderer, st.a_pno, st.b_pno, boxes,
                                           scale=options.thumbnail_scale,
-                                          max_width=options.thumbnail_width)
+                                          max_width=options.thumbnail_width,
+                                          mask_a=mask_a, mask_b=mask_b)
             except Exception:
                 image = None
             if image is None:
@@ -512,15 +627,18 @@ def generate_pdf(path: str, store: ResultStore, info_a: DocumentInfo,
                 y += 16
 
     # -- change pages ------------------------------------------------------
+    summary = _report_summary(store, options, summary)
     stats = [s for s in _iter_report_rows(store, options)
              if s.status != "identical"]
     limit = min(len(stats), options.max_thumbnails)
     for n, st in enumerate(stats[:limit]):
-        boxes = store.get_boxes(st.idx)
+        boxes = _filtered_boxes(store.get_boxes(st.idx), options)
+        mask_a, mask_b = options.masks_for(st.a_pno, st.b_pno)
         try:
             image = render_pair_image(renderer, st.a_pno, st.b_pno, boxes,
                                       scale=options.thumbnail_scale,
-                                      max_width=2200)
+                                      max_width=2200,
+                                      mask_a=mask_a, mask_b=mask_b)
         except Exception:
             continue
         if image is None:
@@ -582,7 +700,7 @@ def generate_csv(path: str, store: ResultStore, options: ReportOptions) -> str:
                 "" if st.b_pno is None else st.b_pno + 1,
                 st.kind, st.status, f"{st.similarity:.4f}",
                 st.text_changes, st.image_changes, st.total_changes,
-                *[st.counts.get(c, 0) for c in ALL_CATEGORIES],
+                *[options.counts_for(st).get(c, 0) for c in ALL_CATEGORIES],
                 "; ".join(st.flag_labels()),
             ])
     return path
@@ -597,6 +715,12 @@ def generate_json(path: str, store: ResultStore, info_a: DocumentInfo,
         "title": options.title,
         "documents": {"a": info_a.to_dict(), "b": info_b.to_dict()},
         "settings": settings_dict or {},
+        "report_filter": {"masked_areas": len(options.ignore_rules)
+                          if options.mask_ignored else 0,
+                          "categories": sorted(options.selected()),
+                          "excluded": sorted(options.excluded()),
+                          "page_range": options.page_range or None,
+                          "includes_identical": options.include_identical},
         "summary": summary.to_dict(),
         "pages": [],
     }
@@ -608,7 +732,7 @@ def generate_json(path: str, store: ResultStore, info_a: DocumentInfo,
             "kind": st.kind,
             "status": st.status,
             "similarity": round(st.similarity, 4),
-            "counts": st.counts,
+            "counts": options.counts_for(st),
             "flags": st.flags,
         })
     with open(path, "w", encoding="utf-8") as fh:

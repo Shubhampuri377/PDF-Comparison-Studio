@@ -589,7 +589,9 @@ class MainWindow(QMainWindow):
                 f"{os.path.splitext(os.path.basename(self.engine.path_b))[0]}")
 
         dialog = ReportDialog(self.palette_, default_dir, base[:80],
-                              self.summary.changed, self)
+                              self.summary.changed,
+                              ignore_rules=self.results_page.ignore_rules(),
+                              parent=self)
         dialog.export_btn.clicked.connect(
             lambda: self._run_report(dialog))
         dialog.exec()

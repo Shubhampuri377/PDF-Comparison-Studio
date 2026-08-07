@@ -38,6 +38,9 @@ _MAX_BAND = 1024
 # be genuinely similar (better than ~0.55 by default) to beat skipping both.
 _GAP_PENALTY = 0.55
 
+# Pages sampled per document to estimate which tokens are boilerplate.
+_BACKGROUND_SAMPLE = 150
+
 
 def positional_pairs(n_a: int, n_b: int) -> list[tuple[int | None, int | None, str]]:
     """Index-for-index pairing; the behaviour of the old engine."""
@@ -225,7 +228,8 @@ def align_documents(exact_a: list[int], exact_b: list[int],
                     sims_a: list[int], sims_b: list[int],
                     counts_a: list[int], counts_b: list[int],
                     min_similarity: float = 0.55,
-                    enabled: bool = True) -> list[tuple[int | None, int | None, str]]:
+                    enabled: bool = True,
+                    tokens_for=None) -> list[tuple[int | None, int | None, str]]:
     """Produce the ordered list of page pairs for the whole comparison."""
     n_a, n_b = len(exact_a), len(exact_b)
     if not enabled:
@@ -249,7 +253,158 @@ def align_documents(exact_a: list[int], exact_b: list[int],
         prev_a, prev_b = a_idx + 1, b_idx + 1
     pairs.extend(_align_gap(sims_a, sims_b, counts_a, counts_b,
                             prev_a, n_a, prev_b, n_b, min_similarity))
+
+    # A monotonic mapping cannot express a page that moved past its
+    # neighbours; recover those before calling anything removed.
+    pairs, _rescued = rescue_reordered(pairs, exact_a, exact_b, sims_a, sims_b,
+                                       tokens_for=tokens_for)
     return pairs
+
+
+def rescue_reordered(pairs, exact_a: list[int], exact_b: list[int],
+                     sims_a: list[int], sims_b: list[int],
+                     tokens_for=None, min_score: float = 0.35,
+                     max_candidates: int = 4_000_000):
+    """Pair up leftover pages that were reordered rather than removed.
+
+    Everything above this point is order-preserving: patience anchoring and
+    the banded DP both produce a monotonic mapping, because that is what a
+    document edited in place looks like. Batch-generated documents are not
+    like that. Regenerate a run of 1,000 trade confirmations and the same
+    confirmation can land at a completely different index -- page 991 in one
+    file, page 468 in the other. A monotonic alignment cannot express that
+    crossing, so it has no choice but to call one page removed and the other
+    added, and the reviewer is told content vanished when it plainly did not.
+
+    This pass takes only the pages the monotonic phase gave up on and matches
+    them to each other regardless of position: identical fingerprints first,
+    then perceptual similarity. Anything still unpaired stays genuinely
+    added or removed.
+    """
+    leftover_a = [p[0] for p in pairs if p[2] == KIND_REMOVED and p[0] is not None]
+    leftover_b = [p[1] for p in pairs if p[2] == KIND_ADDED and p[1] is not None]
+    if not leftover_a or not leftover_b:
+        return pairs, 0
+
+    matches: dict[int, int] = {}
+
+    # Pass 1: identical content, wherever it ended up.
+    by_hash: dict[int, list[int]] = {}
+    for j in leftover_b:
+        by_hash.setdefault(exact_b[j], []).append(j)
+    still_a: list[int] = []
+    for i in leftover_a:
+        pool = by_hash.get(exact_a[i])
+        if pool:
+            matches[i] = pool.pop(0)
+        else:
+            still_a.append(i)
+    taken = set(matches.values())
+    still_b = [j for j in leftover_b if j not in taken]
+
+    # Pass 2: near-identical content, when a token supplier is available.
+    #
+    # Simhash is deliberately NOT used here. On batch-generated documents --
+    # a run of trade confirmations, invoices, statements -- every page shares
+    # the same letterhead, addresses and legal boilerplate, so a whole-bag
+    # similarity is near 1.0 between pages that have nothing to do with each
+    # other. Matching on that produced confident pairings of unrelated pages,
+    # which is worse than admitting the page was not found.
+    #
+    # What actually identifies such a page is its rare tokens: the trade
+    # number, the account, the CUSIP. ``tokens_for`` supplies them and the
+    # score weights each shared token by how rare it is across the candidate
+    # set, so boilerplate contributes almost nothing.
+    if still_a and still_b and tokens_for is not None \
+            and len(still_a) * len(still_b) <= max_candidates:
+        # Sample pages from across both documents so token rarity is judged
+        # against the document as a whole, not against ten similar leftovers.
+        background = []
+        for side, total in ((0, len(exact_a)), (1, len(exact_b))):
+            if total:
+                step = max(1, total // _BACKGROUND_SAMPLE)
+                background.extend(tokens_for(side, k)
+                                  for k in range(0, total, step))
+        matches.update(_match_by_rare_tokens(still_a, still_b, tokens_for,
+                                             background, min_score))
+
+    if not matches:
+        return pairs, 0
+
+    paired_b = set(matches.values())
+    rebuilt: list[tuple[int | None, int | None, str]] = []
+    for a, b, kind in pairs:
+        if kind == KIND_REMOVED and a in matches:
+            rebuilt.append((a, matches[a], KIND_MATCHED))
+        elif kind == KIND_ADDED and b in paired_b:
+            continue                      # now carried by its A partner
+        else:
+            rebuilt.append((a, b, kind))
+    return rebuilt, len(matches)
+
+
+# A token on this many pages or fewer (within the sampled background) is
+# treated as identifying rather than boilerplate.
+_RARE_DF = 5
+# A rescue needs at least this many shared identifying tokens, and this
+# fraction of the page's own identifying tokens, before it is believed.
+_MIN_SHARED_RARE = 3
+_MIN_RARE_FRACTION = 0.6
+
+
+def _match_by_rare_tokens(a_pages, b_pages, tokens_for, background,
+                          min_score: float):
+    """Pair pages on identifying tokens, and refuse to guess.
+
+    Weighting by document frequency is only meaningful against a realistic
+    background. Computing it from the leftover pages alone was the mistake
+    that made this pass useless: on a run of trade confirmations those pages
+    share hundreds of boilerplate tokens, every one of them looks "rare"
+    within a sample of ten, and the matcher confidently paired pages that had
+    nothing in common. Document frequency is therefore measured against a
+    sample of pages from across the document.
+
+    The bar to declare a match is deliberately high. A page whose identifying
+    tokens are absent from the other document has genuinely been removed, and
+    saying so is more useful than inventing a partner for it.
+    """
+    side_a = {i: tokens_for(0, i) for i in a_pages}
+    side_b = {j: tokens_for(1, j) for j in b_pages}
+
+    df: dict[str, int] = {}
+    for bag in background:
+        for tok in bag:
+            df[tok] = df.get(tok, 0) + 1
+
+    def rare(bag: set) -> set:
+        return {t for t in bag if df.get(t, 0) <= _RARE_DF}
+
+    rare_a = {i: rare(bag) for i, bag in side_a.items()}
+    rare_b = {j: rare(bag) for j, bag in side_b.items()}
+
+    scored: list[tuple[float, int, int]] = []
+    for i, ra in rare_a.items():
+        if len(ra) < _MIN_SHARED_RARE:
+            continue                      # nothing distinctive to match on
+        for j, rb in rare_b.items():
+            shared = ra & rb
+            if len(shared) < _MIN_SHARED_RARE:
+                continue
+            fraction = len(shared) / max(len(ra), len(rb))
+            if fraction >= max(min_score, _MIN_RARE_FRACTION):
+                scored.append((fraction, i, j))
+
+    scored.sort(reverse=True)
+    out: dict[int, int] = {}
+    used_a: set[int] = set()
+    used_b: set[int] = set()
+    for _score, i, j in scored:
+        if i in used_a or j in used_b:
+            continue
+        out[i] = j
+        used_a.add(i)
+        used_b.add(j)
+    return out
 
 
 def alignment_stats(pairs) -> dict:

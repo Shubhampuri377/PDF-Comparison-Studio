@@ -213,8 +213,42 @@ def compose_side_by_side(left, right, gap: int = 16,
     return canvas
 
 
+def mask_regions(image, rendered: RenderedPage, fractions,
+                 label: str = "excluded from comparison"):
+    """Cover excluded regions so a report only shows what was actually checked.
+
+    Painted opaque rather than tinted: a reviewer reading the report should
+    not be able to mistake un-compared content for content that was compared
+    and found identical. The hatching and caption make the omission
+    deliberate and obvious instead of looking like a rendering fault.
+    """
+    from PIL import Image, ImageDraw
+
+    if not fractions:
+        return image
+
+    out = image.convert("RGB")
+    draw = ImageDraw.Draw(out)
+    w, h = out.size
+    for fx0, fy0, fx1, fy1 in fractions:
+        x0, y0 = int(fx0 * w), int(fy0 * h)
+        x1, y1 = int(fx1 * w), int(fy1 * h)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        draw.rectangle([x0, y0, x1, y1], fill=(242, 244, 247),
+                       outline=(176, 184, 196), width=2)
+        step = max(10, (y1 - y0) // 14)
+        for offset in range(0, (x1 - x0) + (y1 - y0), step):
+            draw.line([(x0 + offset, y0), (x0, y0 + offset)],
+                      fill=(214, 220, 229), width=1)
+        if label and (x1 - x0) > 140 and (y1 - y0) > 22:
+            draw.text((x0 + 8, y0 + 6), label, fill=(120, 130, 145))
+    return out
+
+
 def render_pair_image(renderer: PageRenderer, a_pno, b_pno, boxes,
-                      scale: float = 1.0, max_width: int | None = None):
+                      scale: float = 1.0, max_width: int | None = None,
+                      mask_a=None, mask_b=None):
     """Full side-by-side composite with highlights, for reports."""
     from PIL import Image
 
@@ -222,9 +256,15 @@ def render_pair_image(renderer: PageRenderer, a_pno, b_pno, boxes,
     ra = renderer.render(0, a_pno, scale) if a_pno is not None else None
     rb = renderer.render(1, b_pno, scale) if b_pno is not None else None
     if ra is not None:
-        left = paint_highlights(to_pil(ra), ra, boxes, 0)
+        left = to_pil(ra)
+        if mask_a:
+            left = mask_regions(left, ra, mask_a)
+        left = paint_highlights(left, ra, boxes, 0)
     if rb is not None:
-        right = paint_highlights(to_pil(rb), rb, boxes, 1)
+        right = to_pil(rb)
+        if mask_b:
+            right = mask_regions(right, rb, mask_b)
+        right = paint_highlights(right, rb, boxes, 1)
 
     composite = compose_side_by_side(left, right)
     if composite is not None and max_width and composite.width > max_width:
